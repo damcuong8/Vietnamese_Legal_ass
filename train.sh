@@ -70,7 +70,7 @@ env \
   LANGSMITH_TRACING=false \
   CHECKPOINTER_BACKEND=none \
   COMPRESS_LLM_ENABLE_THINKING=false \
-  python plz_5h_left.py \
+  python evaluation.py \
     --llm-backend default \
     --workers 8 \
     --start-id 650 \

@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field
 import torch
 import os
 import threading
+import json
+import time
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
 import py_vncorenlp
@@ -18,6 +20,7 @@ from Agents.config import (
     COMPRESS_LLM_TEMPERATURE, COMPRESS_LLM_TOP_P, COMPRESS_LLM_TOP_K, COMPRESS_LLM_ENABLE_THINKING,
     RETRIEVER_TOP_K,
     RERANKER_TOP_K,
+    SEARCH_LOCAL_DOCS,
     EMBEDDING_MAX_CONCURRENT,
     RERANKER_MAX_CONCURRENT,
     RERANKER_BATCH_SIZE,
@@ -35,6 +38,7 @@ _resource_init_lock = threading.Lock()
 _embedding_queue = threading.BoundedSemaphore(EMBEDDING_MAX_CONCURRENT)
 _reranker_queue = threading.BoundedSemaphore(RERANKER_MAX_CONCURRENT)
 _vncorenlp_queue = threading.BoundedSemaphore(VNCORENLP_MAX_CONCURRENT)
+_filter_stats_log_lock = threading.Lock()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def _acquire_queue(queue: threading.BoundedSemaphore, name: str) -> None:
@@ -141,7 +145,18 @@ def perform_batch_hybrid_search(bm25_queries: List[str], dense_queries: List[str
     for bm25_query in bm25_queries:
         tokenized_query = tokenize_text(bm25_query)
         es_body.append({"index": INDEX_NAME})
-        es_body.append({"query": {"match": {"content_search": {"query": tokenized_query}}}, "size": top_k, "_source": False})
+        match_query = {"match": {"content_search": {"query": tokenized_query}}}
+        if not SEARCH_LOCAL_DOCS:
+            final_query = {
+                "bool": {
+                    "must": [match_query],
+                    "filter": [{"term": {"is_local": False}}]
+                }
+            }
+        else:
+            final_query = match_query
+            
+        es_body.append({"query": final_query, "size": top_k, "_source": False})
         
     try:
         es_res = es.msearch(body=es_body)
@@ -150,9 +165,25 @@ def perform_batch_hybrid_search(bm25_queries: List[str], dense_queries: List[str
         logger.error(f"[!] Lỗi truy vấn Elasticsearch msearch: {e}")
         es_responses = [[] for _ in bm25_queries]
 
-    from qdrant_client.models import QueryRequest
+    from qdrant_client.models import QueryRequest, Filter, FieldCondition, MatchValue
+    
+    qdrant_filter = None
+    if not SEARCH_LOCAL_DOCS:
+        qdrant_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="is_local",
+                    match=MatchValue(value=False)
+                )
+            ]
+        )
+
     qdrant_requests = [
-        QueryRequest(query=query_vectors[idx].tolist(), limit=top_k)
+        QueryRequest(
+            query=query_vectors[idx].tolist(), 
+            limit=top_k,
+            filter=qdrant_filter
+        )
         for idx in range(len(query_vectors))
     ]
     try:
@@ -291,6 +322,40 @@ class SearchInput(BaseModel):
 class ToolCompressOutput(BaseModel):
     relevant_chunk_ids: List[str] = Field(description="Danh sách ID (Ví dụ: DOC_0, DOC_1) của các tài liệu chứa thông tin liên quan đến mục tiêu tìm kiếm. Bỏ qua các ID vô giá trị.")
 
+def _log_tool_filter_stats(total: int, kept: int, **extra: Any) -> None:
+    total = max(0, int(total or 0))
+    kept = max(0, int(kept or 0))
+    removed = max(0, total - kept)
+    removed_pct = (removed / total * 100.0) if total else 0.0
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "node": "Tool Compress Stats",
+        "input": total,
+        "kept": kept,
+        "removed": removed,
+        "removed_pct": round(removed_pct, 3),
+        **extra,
+    }
+    logger.info(
+        "[Tool Compress Stats] input=%s kept=%s removed=%s removed_pct=%.1f%% %s",
+        total,
+        kept,
+        removed,
+        removed_pct,
+        " ".join(f"{key}={value}" for key, value in extra.items()),
+    )
+
+    log_path = os.getenv("FILTER_STATS_LOG_PATH", "").strip()
+    if not log_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with _filter_stats_log_lock:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Không ghi được tool filter stats log: {e}")
+
 def _normalize_query_pairs(queries: List[QueryPair]) -> List[QueryPair]:
     normalized_queries = []
     for query in queries or []:
@@ -328,6 +393,7 @@ def run_hybrid_search_with_ids(queries: List[QueryPair]) -> Tuple[str, List[str]
     "Chạy logic search thật và trả cả text cho LLM lẫn chunk IDs để cập nhật state."
     queries = _normalize_query_pairs(queries)
     if not queries:
+        _log_tool_filter_stats(0, 0, mode="no_queries", query_count=0)
         return "Không có truy vấn tìm kiếm hợp lệ.", []
 
     bm25_queries = [q.bm25_query for q in queries]
@@ -349,6 +415,7 @@ def run_hybrid_search_with_ids(queries: List[QueryPair]) -> Tuple[str, List[str]
                 merged_docs.append(doc)
 
     if not merged_docs:
+        _log_tool_filter_stats(0, 0, mode="no_docs", query_count=len(queries))
         return "Không tìm thấy kết quả pháp lý nào.", []
 
     logger.info(f"[*] Đang chạy LLM Filter chung cho {len(merged_docs)} tài liệu...")
@@ -369,8 +436,18 @@ def run_hybrid_search_with_ids(queries: List[QueryPair]) -> Tuple[str, List[str]
     )
     structured_llm = _required_structured_tool(llm, ToolCompressOutput)
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "Bạn là Thẩm định viên pháp lý. Hãy đọc kỹ các 'Từ khóa tìm kiếm' và 'Các tài liệu' dưới đây. NẾU tài liệu trả lời được hoặc có liên quan trực tiếp đến BẤT KỲ từ khóa nào -> Đưa ID của nó (DOC_X) vào danh sách. Nếu không liên quan -> Bỏ qua. BẮT BUỘC trả về kết quả định dạng JSON với duy nhất một key 'relevant_chunk_ids' chứa mảng các ID."),
-        ("human", "Các từ khóa tìm kiếm: {query}\n\nCác tài liệu:\n{context}")
+        ("system", """Bạn là một Thẩm định viên pháp lý chuyên nghiệp. Nhiệm vụ của bạn là LỌC dữ liệu đầu vào để tìm ra căn cứ pháp lý chính xác nhất.
+Quy tắc cực kỳ nghiêm ngặt:
+1. Bạn sẽ nhận được các truy vấn/từ khóa tìm kiếm bổ sung và các tài liệu được hệ thống tìm về.
+2. Đối chiếu từng tài liệu với mục đích của truy vấn bổ sung.
+3. Lưu ý kiểm tra kỹ các metadata đi kèm trong nội dung tài liệu như legal_type, document_number, article_no, effect_date để xác định đúng căn cứ.
+4. NẾU tài liệu KHÔNG LIÊN QUAN hoặc không giải quyết được mục đích tìm kiếm -> BỎ QUA ID ĐÓ.
+5. NẾU tài liệu LIÊN QUAN TRỰC TIẾP và đáp ứng đúng mục đích tìm kiếm -> Đưa ID (DOC_X) của nó vào danh sách trả về.
+6. Không giữ tài liệu chỉ vì có chung vài từ khóa bề mặt nhưng không trả lời được vấn đề pháp lý cần tìm.
+
+Mục đích của bạn là cung cấp bộ chứng cứ sạch, chính xác và có giá trị pháp lý cao nhất.
+BẮT BUỘC trả về kết quả định dạng JSON với duy nhất một key `relevant_chunk_ids` chứa mảng các ID."""),
+        ("human", "Các truy vấn/từ khóa tìm kiếm bổ sung:\n{query}\n\nCác tài liệu:\n{context}")
     ])
     chain = prompt | structured_llm
 
@@ -384,9 +461,30 @@ def run_hybrid_search_with_ids(queries: List[QueryPair]) -> Tuple[str, List[str]
         unique_docs = [doc_mapping[tid] for tid in valid_temp_ids if tid in doc_mapping]
         if not unique_docs:
             unique_docs = merged_docs[:1]
+            _log_tool_filter_stats(
+                len(merged_docs),
+                len(unique_docs),
+                mode="fallback_empty_filter",
+                query_count=len(queries),
+                selected_temp_ids=len(valid_temp_ids),
+            )
+        else:
+            _log_tool_filter_stats(
+                len(merged_docs),
+                len(unique_docs),
+                mode="structured",
+                query_count=len(queries),
+                selected_temp_ids=len(valid_temp_ids),
+            )
     except Exception as e:
         logger.error(f"[!] Lỗi LLM nén chung: {e}")
         unique_docs = merged_docs[:1]
+        _log_tool_filter_stats(
+            len(merged_docs),
+            len(unique_docs),
+            mode="fallback_error",
+            query_count=len(queries),
+        )
 
     if not unique_docs:
         return "Không tìm thấy kết quả pháp lý nào.", []

@@ -4,6 +4,7 @@ from langchain_core.messages import BaseMessage
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
+    question_id: int
     question: str 
 
     search_targets: List[Dict[str, Any]] 

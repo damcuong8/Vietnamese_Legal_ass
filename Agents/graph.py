@@ -15,13 +15,17 @@ from Agents.logs.agent_logger import logger
 from Agents.config import (
     MAIN_LLM_TEMPERATURE, MAIN_LLM_TOP_P, MAIN_LLM_TOP_K, MAIN_LLM_ENABLE_THINKING, PLANNER_THINKING_TOKEN_BUDGET,
     COMPRESS_LLM_TEMPERATURE, COMPRESS_LLM_TOP_P, COMPRESS_LLM_TOP_K, COMPRESS_LLM_ENABLE_THINKING, REASONING_THINKING_TOKEN_BUDGET,
-    RETRIEVER_TOP_K, RERANKER_TOP_K
+    REASONING_ENABLE_TOOLS, REASONING_MAX_TOOL_CALLS, RETRIEVER_TOP_K, RERANKER_TOP_K
 )
 from typing import Any
+import json
 import os
 import re
+import threading
+import time
 
 SKILLS_DIR = os.path.join(os.path.dirname(__file__), "skills")
+_filter_stats_log_lock = threading.Lock()
 
 with open(os.path.join(SKILLS_DIR, "vietnamese_legal_hybrid_search_analysis.md"), "r", encoding="utf-8") as f:
     PLANNER_SKILL_PROMPT = f.read()
@@ -54,6 +58,45 @@ def _pydantic_to_dict(model: Any) -> dict:
         return model.model_dump()
     return model.dict()
 
+def _validate_structured_value(schema: type[BaseModel], value: Any):
+    if hasattr(schema, "model_validate"):
+        return schema.model_validate(value)
+    return schema.parse_obj(value)
+
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content or "")
+
+def _extract_json_object(text: str) -> Any:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(cleaned[idx:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("No JSON object found in model response")
+
 def _invoke_structured_with_retries(chain, payload: dict[str, Any], label: str, max_attempts: int = 3):
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
@@ -70,6 +113,41 @@ def _invoke_structured_with_retries(chain, payload: dict[str, Any], label: str, 
                 logger.error(f"{label} structured output lỗi sau {max_attempts} lần: {e}")
     raise RuntimeError(f"{label} structured output failed after {max_attempts} attempts") from last_error
 
+def _invoke_structured_json_fallback(
+    prompt: ChatPromptTemplate,
+    llm,
+    payload: dict[str, Any],
+    schema: type[BaseModel],
+    label: str,
+    max_attempts: int = 2,
+):
+    schema_json = json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)
+    base_messages = prompt.format_messages(**payload)
+    instruction = (
+        "Endpoint hiện tại không trả về tool call ổn định. "
+        "Hãy trả về DUY NHẤT một JSON object hợp lệ, không markdown, không giải thích, "
+        "khớp schema sau:\n"
+        f"{schema_json}"
+    )
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            messages = base_messages + [HumanMessage(content=instruction)]
+            if last_error is not None:
+                messages.append(HumanMessage(content=f"Lỗi parse lần trước: {last_error}. Hãy sửa và chỉ trả về JSON hợp lệ."))
+            response = llm.invoke(messages)
+            raw_text = _content_to_text(getattr(response, "content", response))
+            value = _extract_json_object(raw_text)
+            return _validate_structured_value(schema, value)
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts:
+                logger.warning(f"{label} JSON fallback lỗi lần {attempt}/{max_attempts}, retry: {e}")
+            else:
+                logger.error(f"{label} JSON fallback lỗi sau {max_attempts} lần: {e}")
+    raise RuntimeError(f"{label} JSON fallback failed after {max_attempts} attempts") from last_error
+
 def _required_structured_tool(llm, schema: type[BaseModel]):
     from langchain_core.output_parsers.openai_tools import PydanticToolsParser
 
@@ -77,6 +155,47 @@ def _required_structured_tool(llm, schema: type[BaseModel]):
         tools=[schema],
         first_tool_only=True,
     )
+
+def _structured_output_mode(label: str) -> str:
+    env_by_label = {
+        "Planner": "PLANNER_STRUCTURED_OUTPUT_MODE",
+        "Compress Node": "COMPRESS_STRUCTURED_OUTPUT_MODE",
+        "Applied Evidence Node": "APPLIED_EVIDENCE_STRUCTURED_OUTPUT_MODE",
+    }
+    specific_env = env_by_label.get(label)
+    if specific_env and os.getenv(specific_env):
+        return os.getenv(specific_env, "auto").strip().lower()
+    return os.getenv("STRUCTURED_OUTPUT_MODE", "auto").strip().lower()
+
+def _invoke_structured_auto(
+    prompt: ChatPromptTemplate,
+    llm,
+    structured_chain,
+    payload: dict[str, Any],
+    schema: type[BaseModel],
+    label: str,
+):
+    mode = _structured_output_mode(label)
+    if mode == "json":
+        return _invoke_structured_json_fallback(prompt, llm, payload, schema, label, max_attempts=3)
+
+    try:
+        return _invoke_structured_with_retries(
+            structured_chain,
+            payload,
+            label,
+        )
+    except Exception as e:
+        if mode == "tool":
+            raise
+        logger.warning(f"{label} structured output dùng tool thất bại, chuyển sang JSON fallback: {e}")
+        return _invoke_structured_json_fallback(
+            prompt,
+            llm,
+            payload,
+            schema,
+            label,
+        )
 
 def _assign_target_ids(search_targets: list[dict]) -> list[dict]:
     normalized_targets = []
@@ -100,6 +219,47 @@ def _build_evidence_id_map(docs: list[dict], start_index: int = 1) -> dict[str, 
             id_map[f"DOC_{idx}"] = real_id
     return id_map
 
+def _question_preview(question: str, max_chars: int = 160) -> str:
+    preview = " ".join(str(question or "").split())
+    return preview[:max_chars].rstrip()
+
+def _log_filter_stats(label: str, total: int, kept: int, **extra: Any) -> None:
+    total = max(0, int(total or 0))
+    kept = max(0, int(kept or 0))
+    removed = max(0, total - kept)
+    removed_pct = (removed / total * 100.0) if total else 0.0
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "node": label.strip("[]"),
+        "input": total,
+        "kept": kept,
+        "removed": removed,
+        "removed_pct": round(removed_pct, 3),
+        **extra,
+    }
+    extra_text = " ".join(f"{key}={value}" for key, value in extra.items())
+    if extra_text:
+        extra_text = " " + extra_text
+    logger.info(
+        "%s input=%s kept=%s removed=%s removed_pct=%.1f%%%s",
+        label,
+        total,
+        kept,
+        removed,
+        removed_pct,
+        extra_text,
+    )
+    log_path = os.getenv("FILTER_STATS_LOG_PATH", "").strip()
+    if not log_path:
+        return
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with _filter_stats_log_lock:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Không ghi được filter stats log: {e}")
+
 def planner_node(state: AgentState):
     """Phân tích câu hỏi, gọi LLM và ép trả về JSON cấu trúc chuẩn theo Skill."""
     question = state.get("question", "")
@@ -118,9 +278,13 @@ def planner_node(state: AgentState):
     ])
     chain = prompt | structured_llm
 
-    parsed_result = _invoke_structured_with_retries(
+    payload = {"question": question}
+    parsed_result = _invoke_structured_auto(
+        prompt,
+        llm,
         chain,
-        {"question": question},
+        payload,
+        PlannerOutput,
         "Planner",
     )
     plan = _pydantic_to_dict(parsed_result)
@@ -160,9 +324,19 @@ class CompressOutput(BaseModel):
 def compress_node(state: AgentState):
     docs = state.get("retrieved_documents", [])
     question = state.get("question", "")
+    question_id = state.get("question_id")
     search_targets = state.get("search_targets", [])
+    total_docs = len(docs)
     
     if not docs:
+        _log_filter_stats(
+            "[Compress Stats]",
+            0,
+            0,
+            question_id=question_id,
+            question_preview=_question_preview(question),
+            reason="no_docs",
+        )
         return {
             "extracted_evidence": "Không tìm thấy căn cứ pháp lý nào phù hợp từ cơ sở dữ liệu.",
             "relevant_chunk_ids": [],
@@ -227,9 +401,13 @@ Mục đích của bạn là cung cấp bộ chứng cứ sạch, chính xác v�
     chain = prompt | structured_llm
 
     try:
-        result = _invoke_structured_with_retries(
+        payload = {"question": question, "context_text": context_text}
+        result = _invoke_structured_auto(
+            prompt,
+            llm,
             chain,
-            {"question": question, "context_text": context_text},
+            payload,
+            CompressOutput,
             "Compress Node",
         )
         valid_temp_ids = result.relevant_chunk_ids
@@ -241,6 +419,25 @@ Mục đích của bạn là cung cấp bộ chứng cứ sạch, chính xác v�
             logger.warning("[!] Không còn tài liệu sau bước lọc. Dùng fallback từ rerank.")
             filtered_docs = docs[:RERANKER_TOP_K]
             valid_real_ids = [d.get("id") for d in filtered_docs]
+            _log_filter_stats(
+                "[Compress Stats]",
+                total_docs,
+                len(filtered_docs),
+                question_id=question_id,
+                question_preview=_question_preview(question),
+                mode="fallback_empty_filter",
+                selected_temp_ids=len(valid_temp_ids),
+            )
+        else:
+            _log_filter_stats(
+                "[Compress Stats]",
+                total_docs,
+                len(filtered_docs),
+                question_id=question_id,
+                question_preview=_question_preview(question),
+                mode="structured",
+                selected_temp_ids=len(valid_temp_ids),
+            )
 
         extracted_evidence = _format_evidence_with_temp_ids(filtered_docs)
         evidence_id_map = _build_evidence_id_map(filtered_docs)
@@ -250,6 +447,14 @@ Mục đích của bạn là cung cấp bộ chứng cứ sạch, chính xác v�
         valid_real_ids = [d.get("id") for d in filtered_docs]
         extracted_evidence = _format_evidence_with_temp_ids(filtered_docs)
         evidence_id_map = _build_evidence_id_map(filtered_docs)
+        _log_filter_stats(
+            "[Compress Stats]",
+            total_docs,
+            len(filtered_docs),
+            question_id=question_id,
+            question_preview=_question_preview(question),
+            mode="fallback_error",
+        )
         
     return {
         "extracted_evidence": extracted_evidence,
@@ -272,8 +477,15 @@ def reasoning_node(state: AgentState):
     if messages and getattr(messages[-1], "type", "") == "tool":
         retries += 1
 
-    if retries >= 3:
-        logger.warning("[!] Đã đạt giới hạn 3 lần gọi tool, ép model trả lời luôn.")
+    tools_enabled_for_call = REASONING_ENABLE_TOOLS and retries < REASONING_MAX_TOOL_CALLS
+
+    if not REASONING_ENABLE_TOOLS:
+        llm_with_tools = llm
+    elif retries >= REASONING_MAX_TOOL_CALLS:
+        logger.warning(
+            "[!] Đã đạt giới hạn %s lần gọi tool, ép model trả lời luôn.",
+            REASONING_MAX_TOOL_CALLS,
+        )
         llm_with_tools = llm
     else:
         llm_with_tools = llm.bind_tools([hybrid_search_tool])
@@ -282,7 +494,6 @@ def reasoning_node(state: AgentState):
     evidence = state.get("extracted_evidence", "")
     plan = state.get("plan", {})
 
-    import json
     initial_plan = json.dumps(plan, ensure_ascii=False, indent=2) if plan else "{}"
 
     retrieval_context = (
@@ -294,20 +505,37 @@ def reasoning_node(state: AgentState):
         "Chỉ trả lời dựa trên các căn cứ pháp lý được cung cấp. "
     )
     
-    if retries >= 3:
-        retrieval_context += "(Hệ thống: BẠN ĐÃ ĐẠT GIỚI HẠN TÌM KIẾM. KHÔNG THỂ GỌI CÔNG CỤ NỮA. HÃY ĐƯA RA CÂU TRẢ LỜI CUỐI CÙNG NGAY BÂY GIỜ TỪ DỮ LIỆU HIỆN CÓ.)"
+    if not REASONING_ENABLE_TOOLS:
+        retrieval_context += "Không gọi công cụ bổ sung ở bước reasoning; hãy trả lời từ các căn cứ đã truy xuất và nén."
+    elif retries >= REASONING_MAX_TOOL_CALLS:
+        retrieval_context += f"(Hệ thống: BẠN ĐÃ ĐẠT GIỚI HẠN {REASONING_MAX_TOOL_CALLS} LẦN TÌM KIẾM. KHÔNG THỂ GỌI CÔNG CỤ NỮA. HÃY ĐƯA RA CÂU TRẢ LỜI CUỐI CÙNG NGAY BÂY GIỜ TỪ DỮ LIỆU HIỆN CÓ.)"
     else:
         retrieval_context += "Nếu căn cứ còn thiếu hoặc chưa đủ chắc chắn, hãy gọi hybrid_search_tool với truy vấn cụ thể để tìm thêm trước khi kết luận."
 
     clean_messages = [m for m in messages if getattr(m, "type", "") != "system"]
     system_msg = SystemMessage(content=REASONING_SKILL_PROMPT + "\n\n" + retrieval_context)
 
+    def _invoke_reasoning(messages_to_send):
+        response = llm_with_tools.invoke(messages_to_send)
+        response_text = _content_to_text(getattr(response, "content", ""))
+        if not getattr(response, "tool_calls", None) and not response_text.strip():
+            if tools_enabled_for_call:
+                logger.warning("[!] Reasoning Node trả về message rỗng. Retry lại với tool.")
+                retry_response = llm_with_tools.invoke(messages_to_send)
+                retry_text = _content_to_text(getattr(retry_response, "content", ""))
+                if getattr(retry_response, "tool_calls", None) or retry_text.strip():
+                    return retry_response
+
+            logger.error("[!] Reasoning Node không hoàn thành: response rỗng sau retry, không fallback bỏ tool.")
+            raise RuntimeError("Reasoning Node returned empty response after retry")
+        return response
+
     if clean_messages and getattr(clean_messages[-1], "type", "") == "tool":
-        response = llm_with_tools.invoke([system_msg] + clean_messages)
+        response = _invoke_reasoning([system_msg] + clean_messages)
         return {"messages": [response], "search_retries": retries}
 
     current_human_msg = HumanMessage(content=question)
-    response = llm_with_tools.invoke([system_msg] + clean_messages + [current_human_msg])
+    response = _invoke_reasoning([system_msg] + clean_messages + [current_human_msg])
 
     return {"messages": [current_human_msg, response], "search_retries": retries}
 
@@ -368,11 +596,13 @@ def _collect_evidence_docs(state: AgentState) -> list[dict]:
 def applied_evidence_node(state: AgentState):
     """Hỏi riêng model sau khi đã có answer để chốt nguồn thật sự được áp dụng."""
     question = state.get("question", "")
+    question_id = state.get("question_id")
     messages = state.get("messages", [])
     answer = _last_final_ai_answer(messages)
     fake_docs = _collect_evidence_docs(state)
     fake_to_real = {doc["fake_id"]: doc["real_id"] for doc in fake_docs}
     valid_fake_ids = set(fake_to_real.keys())
+    total_docs = len(fake_docs)
 
     evidence_context = "\n\n".join(
         f"[{doc['fake_id']}]\n{doc['text']}"
@@ -380,6 +610,15 @@ def applied_evidence_node(state: AgentState):
     )
 
     if not answer or not fake_docs:
+        _log_filter_stats(
+            "[Applied Evidence Stats]",
+            total_docs,
+            0,
+            question_id=question_id,
+            question_preview=_question_preview(question),
+            mode="no_answer_or_docs",
+            candidate_not_applied=total_docs,
+        )
         return {
             "applied_chunk_ids": [],
             "candidate_but_not_applied_chunk_ids": [doc["real_id"] for doc in fake_docs],
@@ -420,13 +659,17 @@ Hãy chọn căn cứ áp dụng thực sự cho câu trả lời trên.""")
     ])
 
     try:
-        result = _invoke_structured_with_retries(
+        payload = {
+            "question": question,
+            "answer": answer,
+            "evidence_context": evidence_context,
+        }
+        result = _invoke_structured_auto(
+            prompt,
+            llm,
             prompt | structured_llm,
-            {
-                "question": question,
-                "answer": answer,
-                "evidence_context": evidence_context,
-            },
+            payload,
+            AppliedEvidenceOutput,
             "Applied Evidence Node",
         )
 
@@ -443,15 +686,37 @@ Hãy chọn căn cứ áp dụng thực sự cho câu trả lời trên.""")
                     output.append(real_id)
             return output
 
+        applied_real_ids = fake_ids_to_real(result.applied_chunk_ids)
+        candidate_real_ids = fake_ids_to_real(result.candidate_but_not_applied_chunk_ids)
+        _log_filter_stats(
+            "[Applied Evidence Stats]",
+            total_docs,
+            len(applied_real_ids),
+            question_id=question_id,
+            question_preview=_question_preview(question),
+            mode="structured",
+            candidate_not_applied=len(candidate_real_ids),
+        )
+
         return {
-            "applied_chunk_ids": fake_ids_to_real(result.applied_chunk_ids),
-            "candidate_but_not_applied_chunk_ids": fake_ids_to_real(result.candidate_but_not_applied_chunk_ids),
+            "applied_chunk_ids": applied_real_ids,
+            "candidate_but_not_applied_chunk_ids": candidate_real_ids,
             "evidence_selection_notes": result.selection_notes,
         }
     except Exception as e:
         logger.error(f"[!] Lỗi tại Applied Evidence Node: {e}")
+        fallback_ids = state.get("relevant_chunk_ids", []) or []
+        _log_filter_stats(
+            "[Applied Evidence Stats]",
+            total_docs,
+            len(fallback_ids),
+            question_id=question_id,
+            question_preview=_question_preview(question),
+            mode="fallback_error",
+            candidate_not_applied=0,
+        )
         return {
-            "applied_chunk_ids": state.get("relevant_chunk_ids", []) or [],
+            "applied_chunk_ids": fallback_ids,
             "candidate_but_not_applied_chunk_ids": [],
             "evidence_selection_notes": "Fallback dùng relevant_chunk_ids do lỗi bước chọn căn cứ áp dụng.",
         }

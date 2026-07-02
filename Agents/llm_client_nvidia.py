@@ -18,6 +18,7 @@ def get_nvidia_llm(
     temperature: float = 0.6,
     top_p: float = 0.95,
     max_tokens: int = 4096,
+    enable_thinking: bool = False,
 ) -> ChatOpenAI:
     if not NVIDIA_API_KEY:
         raise RuntimeError("Missing NVIDIA_API_KEY. Set it in .env or export it before running.")
@@ -30,6 +31,11 @@ def get_nvidia_llm(
         top_p=top_p,
         max_tokens=max_tokens,
         max_retries=3,
+        extra_body={
+            "chat_template_kwargs": {
+                "enable_thinking": enable_thinking,
+            }
+        },
     )
 
 

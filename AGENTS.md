@@ -126,6 +126,30 @@ Retrieval chunk record:
 Every retrieval chunk must map back to exactly one canonical `article_id` when
 possible. If a chunk spans multiple articles, split it before indexing.
 
+## Current Elasticsearch Fields
+
+The current Elasticsearch index is `legal_chunks`. It contains these fields:
+
+| Field | Type | Indexed/searchable | Notes |
+| --- | --- | --- | --- |
+| `chunk_id` | `keyword` | Yes | Unique chunk identifier, also used as the ES document id. |
+| `doc_id` | `keyword` | Yes | Source document id from the crawled/processed corpus. |
+| `legal_type` | `keyword` | Yes | Document type, for example `Luật`, `Nghị định`, `Thông tư`, `Quyết định`. |
+| `document_number` | `keyword` | Yes | Legal document number, for example `04/2017/QH14`, `80/2021/NĐ-CP`. |
+| `effect_date` | `date` | Yes | Effective date, accepts `yyyy-MM-dd`, `dd/MM/yyyy`, strict date, or epoch millis. |
+| `effectless_date` | `date` | Yes | End-of-effect date with the same date formats as `effect_date`. |
+| `article_no` | `keyword` | Yes | Article/section label, for example `Điều 5`, `PHỤ LỤC`, `Mục 4`. |
+| `raw_title` | `keyword` | No | Full document title returned in `_source`; not searchable/filterable in ES. |
+| `article_title` | `keyword` | No | Article title returned in `_source`; not searchable/filterable in ES. |
+| `raw_content` | `keyword` | No | Original chunk text returned in `_source`; not searchable/filterable in ES. |
+| `content_search` | `text` | Yes | Main BM25 field, analyzed with `vi_whitespace_lower`. |
+
+Important limitations:
+
+- The current ES index does not contain `issuing_authority`, `signers`, `issuance_date`, or `is_local`.
+- `issuing_authority` exists in source metadata, but it is not copied into `legal_chunks`.
+- Filtering local documents in ES currently requires expensive wildcard checks on `document_number`; a future index should add an indexed boolean field such as `is_local`.
+
 ## Retrieval Strategy
 
 Use article-level retrieval as the core design.
